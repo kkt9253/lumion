@@ -24,7 +24,7 @@ API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise ValueError("GOOGLE_API_KEY 환경 변수가 설정되지 않았습니다. .env 파일을 확인해주세요.")
 genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 # MySQL 환경 변수 설정
 MYSQL_HOST = os.getenv("MYSQL_HOST")
@@ -43,7 +43,9 @@ collection = None
 
 # Sentence Transformer 모델 로드
 embedding_model = None
-MODEL_NAME = 'snunlp/KR-SBERT-V40K-klueNLI-augSTS'
+# IT 분야에 특화된 모델로 변경 (성능 향상을 위함)
+# 모델 경로를 직접 지정하여 허깅페이스의 자동 경로 탐색 오류를 방지합니다.
+MODEL_NAME = 'intfloat/multilingual-e5-large-instruct'
 
 # MySQL 연결 변수
 mysql_conn = None
