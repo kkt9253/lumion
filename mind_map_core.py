@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Path
 from dotenv import load_dotenv
+from fastapi import status
 
 # .env 파일에서 환경 변수를 로드합니다.
 load_dotenv()
@@ -21,7 +22,7 @@ API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise ValueError("GOOGLE_API_KEY 환경 변수가 설정되지 않았습니다. .env 파일을 확인해주세요.")
 genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 # Neo4j 환경 변수 설정
 NEO4J_URI = os.getenv("NEO4J_URI")
@@ -74,7 +75,7 @@ class NodeDetailResponse(BaseModel):
     name: str
     description: str | None
 
-# --- Gemini API 호출 함수들 ---
+# --- Gemini API 호출 함수들 (변경 없음) ---
 async def get_direct_answer_from_question(question: str) -> str:
     """Gemini API를 사용하여 사용자의 질문에 직접 답변합니다."""
     prompt = f"다음 질문에 대해 명확하고 상세하게 한국어로 답변해주세요: {question}"
@@ -136,12 +137,16 @@ async def get_additional_info_and_questions(keywords: List[str]) -> Dict[str, An
         print(f"새 키워드 정보 생성 중 오류 발생: {e}")
         return {"answers": [], "expansion_questions": []}
 
-# --- 데이터베이스 및 로직 함수들 ---
-async def get_all_keywords_from_db() -> Dict[str, str]:
-    """Neo4j DB에서 현재 저장된 모든 키워드를 {이름: 설명} 형태의 딕셔너리로 가져옵니다."""
+# --- 데이터베이스 및 로직 함수들 (로직 변경) ---
+async def get_all_keywords_from_db() -> Dict[str, Dict[str, Any]]:
+    """Neo4j DB에서 키워드 이름, 설명, 임베딩을 포함한 전체 데이터를 가져옵니다."""
+    query = "MATCH (n:Keyword) WHERE n.embedding IS NOT NULL RETURN n.name AS name, n.description AS description, n.embedding AS embedding"
     with neo4j_driver.session() as session:
-        result = session.run("MATCH (n:Keyword) RETURN n.name AS name, n.description AS description")
-        return {record["name"]: record["description"] for record in result}
+        result = session.run(query)
+        return {
+            record["name"]: {"description": record["description"], "embedding": record["embedding"]}
+            for record in result
+        }
 
 def find_strongest_connections(all_keywords: List[str], embeddings: np.ndarray, threshold: float) -> List[Dict[str, Any]]:
     """모든 키워드에 대해 유사도를 계산하고, 사이클이 없는 최강의 연결만 반환합니다."""
@@ -170,19 +175,41 @@ def find_strongest_connections(all_keywords: List[str], embeddings: np.ndarray, 
     uf = UnionFind(all_keywords)
     return [conn for conn in all_connections if uf.union(conn['source'], conn['target'])]
 
-async def save_to_neo4j(new_keywords_with_desc: List[Dict[str, str]], links: List[Dict[str, Any]]):
-    """새로운 키워드(노드)와 링크(관계)를 Neo4j에 저장합니다."""
+async def save_to_neo4j(new_keywords_data: List[Dict[str, Any]], links: List[Dict[str, Any]]):
+    """새로운 키워드(노드+임베딩)와 링크(관계)를 Neo4j에 저장합니다."""
     with neo4j_driver.session() as session:
-        for kw_data in new_keywords_with_desc:
-            session.run("MERGE (k:Keyword {name: $name}) ON CREATE SET k.description = $description",
-                        name=kw_data['keyword'], description=kw_data['description'])
+        # 1. 새로운 노드와 임베딩 저장
+        for kw_data in new_keywords_data:
+            session.run(
+                "MERGE (k:Keyword {name: $name}) "
+                "SET k.description = $description, k.embedding = $embedding",
+                name=kw_data['keyword'],
+                description=kw_data['description'],
+                embedding=kw_data['embedding']
+            )
+        # 2. 새로운 관계 저장
         for link in links:
             session.run("MATCH (a:Keyword {name: $source}) MATCH (b:Keyword {name: $target}) "
                         "MERGE (a)-[r:RELATED_TO]-(b) SET r.similarity = $similarity",
                         source=link['source'], target=link['target'], similarity=link['similarity'])
+    if new_keywords_data or links:
         print("Neo4j에 데이터 저장 완료!")
 
-# --- FastAPI 엔드포인트 ---
+
+@app.delete("/delete-all", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_all_data():
+    """
+    Neo4j 데이터베이스의 모든 노드와 관계를 삭제합니다.
+    """
+    try:
+        with neo4j_driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+        print("데이터베이스의 모든 데이터가 삭제되었습니다.")
+        return
+    except Exception as e:
+        print(f"데이터 삭제 중 오류 발생: {e}")
+        raise HTTPException(status_code=500, detail="데이터 삭제 중 오류가 발생했습니다.")
+    
 @app.post("/generate_mind_map_data")
 async def process_and_generate_mind_map_neo4j(request: QuestionRequest):
     """사용자의 질문을 바탕으로 마인드맵 데이터를 생성하고 Neo4j에 저장합니다."""
@@ -194,30 +221,52 @@ async def process_and_generate_mind_map_neo4j(request: QuestionRequest):
     if not extracted_keywords:
         raise HTTPException(status_code=400, detail="키워드를 추출할 수 없습니다.")
 
-    # 3. 기존 키워드를 DB에서 가져오고, 새로운 키워드를 필터링합니다.
-    all_keywords_in_db = await get_all_keywords_from_db()
-    existing_keyword_names = set(all_keywords_in_db.keys())
+    # 3. DB에서 기존 키워드 데이터(설명, 임베딩 포함)를 가져오고 새로운 키워드를 필터링합니다.
+    all_keywords_data_in_db = await get_all_keywords_from_db()
+    existing_keyword_names = set(all_keywords_data_in_db.keys())
     new_keywords_to_process = [kw for kw in extracted_keywords if kw not in existing_keyword_names]
 
-    # 4. '새로운' 키워드가 있을 경우에만, 해당 키워드에 대한 정보(설명, 확장 질문)를 생성합니다.
+    # 4. 새로운 키워드에 대한 설명/질문 생성 및 임베딩 계산
     new_keyword_info = await get_additional_info_and_questions(new_keywords_to_process)
-
-    # 5. 마인드맵 구성을 위해 모든 키워드 목록과 임베딩을 준비합니다.
-    all_unique_keywords = list(existing_keyword_names.union(set(extracted_keywords)))
-    all_embeddings = embedding_model.encode(all_unique_keywords)
     
+    new_keywords_to_save = []
+    new_keyword_embeddings_map = {}
+    if new_keywords_to_process:
+        # 새로 추가할 키워드의 임베딩만 계산합니다.
+        new_embeddings_list = embedding_model.encode(new_keywords_to_process).tolist()
+        descriptions_map = {ans['keyword']: ans['description'] for ans in new_keyword_info.get('answers', [])}
+
+        for i, keyword in enumerate(new_keywords_to_process):
+            embedding = new_embeddings_list[i]
+            new_keyword_embeddings_map[keyword] = embedding
+            new_keywords_to_save.append({
+                "keyword": keyword,
+                "description": descriptions_map.get(keyword, "설명 없음"),
+                "embedding": embedding,
+            })
+    
+    # 5. 유사도 계산을 위해 전체 키워드 및 임베딩 목록을 준비합니다.
+    all_unique_keywords = list(existing_keyword_names.union(set(extracted_keywords)))
+    all_embeddings = []
+    for keyword in all_unique_keywords:
+        if keyword in existing_keyword_names:
+            all_embeddings.append(all_keywords_data_in_db[keyword]["embedding"])
+        else:
+            all_embeddings.append(new_keyword_embeddings_map[keyword])
+
     # 6. 키워드 간의 연결(링크)을 생성하고 DB에 저장합니다.
-    links_to_save = find_strongest_connections(all_unique_keywords, all_embeddings, 0.4)
-    await save_to_neo4j(new_keyword_info.get('answers', []), links_to_save)
+    links_to_save = find_strongest_connections(all_unique_keywords, np.array(all_embeddings), 0.4)
+    await save_to_neo4j(new_keywords_to_save, links_to_save)
     
     # 7. 최종 반환할 응답을 조립합니다.
     full_answer = ""
     if direct_answer and direct_answer != "답변을 생성하는 데 실패했습니다.":
         full_answer += f"{direct_answer}\n\n---\n\n"
 
-    # 새로 생성된 키워드 설명을 전체 목록에 업데이트
-    for answer in new_keyword_info.get('answers', []):
-        all_keywords_in_db[answer['keyword']] = answer['description']
+    # 전체 키워드의 설명 데이터를 하나로 합칩니다.
+    final_descriptions_map = {name: data["description"] for name, data in all_keywords_data_in_db.items()}
+    for item in new_keywords_to_save:
+        final_descriptions_map[item['keyword']] = item['description']
 
     if new_keyword_info.get('answers'):
         full_answer += "### 새롭게 추가된 키워드 설명\n\n"
@@ -232,7 +281,7 @@ async def process_and_generate_mind_map_neo4j(request: QuestionRequest):
             full_answer += f"- {q}\n"
     
     final_nodes = [
-        {"id": kw, "name": kw, "description": all_keywords_in_db.get(kw, "설명 없음")}
+        {"id": kw, "name": kw, "description": final_descriptions_map.get(kw, "설명 없음")}
         for kw in all_unique_keywords
     ]
 
@@ -247,21 +296,14 @@ async def process_and_generate_mind_map_neo4j(request: QuestionRequest):
 
 @app.get("/node/{node_name}", response_model=NodeDetailResponse)
 async def get_node_details(node_name: str = Path(..., description="정보를 조회할 노드의 이름")):
-    """
-    특정 노드의 이름과 설명을 반환합니다.
-    """
-    # 관련 노드를 찾는 쿼리 부분을 제거
-    query = """
-    MATCH (n:Keyword {name: $name})
-    RETURN n.name AS name, n.description AS description
-    """
+    """특정 노드의 이름과 설명을 반환합니다."""
+    query = "MATCH (n:Keyword {name: $name}) RETURN n.name AS name, n.description AS description"
     try:
         with neo4j_driver.session() as session:
             result = session.run(query, name=node_name).single()
             if not result:
                 raise HTTPException(status_code=404, detail="해당 이름의 노드를 찾을 수 없습니다.")
 
-            # 반환값에서 related_nodes 제거
             return {
                 "name": result["name"],
                 "description": result["description"]
@@ -271,6 +313,7 @@ async def get_node_details(node_name: str = Path(..., description="정보를 조
     except Exception as e:
         print(f"노드 상세 정보 조회 중 오류 발생: {e}")
         raise HTTPException(status_code=500, detail="서버 내부 오류가 발생했습니다.")
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
